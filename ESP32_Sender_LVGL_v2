@@ -1,0 +1,241 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <lvgl.h>
+#include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
+#include "ui.h"
+
+// --- Touch pins for CYD-2432S028 ---
+#define TOUCH_CS 33
+#define TOUCH_IRQ 36
+#define TOUCH_MISO 39
+#define TOUCH_MOSI 32
+#define TOUCH_CLK  25
+
+#define SCREEN_WIDTH  320
+#define SCREEN_HEIGHT 240
+
+TFT_eSPI tft = TFT_eSPI();
+SPIClass touchSPI(VSPI);
+XPT2046_Touchscreen touch(TOUCH_CS, TOUCH_IRQ);
+
+lv_disp_draw_buf_t draw_buf;
+lv_color_t buf[SCREEN_WIDTH * 10];
+lv_indev_t * indev_touch;
+
+// --- ESP-NOW receiver MAC ---
+uint8_t receiverAddress[] = {0xEC, 0xE3, 0x34, 0x1B, 0x2B, 0xF4}; // replace with your receiver MAC
+
+// --- LVGL Tick Label & Timer ---
+lv_obj_t *ui_CheckLabel = NULL;
+lv_timer_t *hide_tick_timer = NULL;
+
+// ================================
+// Fade animation callback (FIXED)
+// ================================
+void set_tick_opacity(void *obj, int32_t v) {
+    lv_obj_t *label = (lv_obj_t *)obj;
+    lv_obj_set_style_opa(label, (lv_opa_t)v, 0);
+}
+
+// ================================
+// Show ✅ Message Sent
+// ================================
+void showMessageSentTick() {
+    // Create label once
+    if (!ui_CheckLabel) {
+        ui_CheckLabel = lv_label_create(lv_scr_act());
+        lv_label_set_text(ui_CheckLabel, LV_SYMBOL_OK);
+        lv_obj_align(ui_CheckLabel, LV_ALIGN_BOTTOM_MID, 0, -10);
+        lv_obj_set_style_text_color(ui_CheckLabel, lv_color_hex(0x00FF00), 0);
+        lv_obj_set_style_text_font(ui_CheckLabel, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_opa(ui_CheckLabel, 0, 0); // initially invisible
+    }
+
+    // If old timer still active, delete it
+    if (hide_tick_timer) {
+        lv_timer_del(hide_tick_timer);
+        hide_tick_timer = NULL;
+    }
+
+    // Fade in
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, ui_CheckLabel);
+    lv_anim_set_exec_cb(&a, set_tick_opacity);
+    lv_anim_set_values(&a, 0, 255);
+    lv_anim_set_time(&a, 300);
+    lv_anim_start(&a);
+
+    // Create a timer to fade out after 2 seconds
+    hide_tick_timer = lv_timer_create([](lv_timer_t *t) {
+        lv_obj_t *label = (lv_obj_t *)t->user_data;
+
+        lv_anim_t a2;
+        lv_anim_init(&a2);
+        lv_anim_set_var(&a2, label);
+        lv_anim_set_exec_cb(&a2, set_tick_opacity);
+        lv_anim_set_values(&a2, 255, 0);
+        lv_anim_set_time(&a2, 300);
+        lv_anim_start(&a2);
+
+        lv_timer_del(t);
+        hide_tick_timer = NULL;
+    }, 2000, ui_CheckLabel);
+}
+
+// ================================
+// ESP-NOW send callback
+// ================================
+void OnDataSent(const wifi_tx_info_t *mac_tx, esp_now_send_status_t status) {
+    Serial.print("ESP-NOW send status: ");
+    Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+}
+
+// ================================
+// ESP-NOW initialization
+// ================================
+void initEspNow() {
+    WiFi.mode(WIFI_STA);
+
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("ESP-NOW init failed");
+        return;
+    }
+
+    esp_now_register_send_cb(OnDataSent);
+
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, receiverAddress, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("Failed to add peer");
+    } else {
+        Serial.println("ESP-NOW peer added!");
+    }
+}
+
+// ================================
+// LVGL flush
+// ================================
+void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
+    uint32_t w = (area->x2 - area->x1 + 1);
+    uint32_t h = (area->y2 - area->y1 + 1);
+
+    tft.startWrite();
+    tft.setAddrWindow(area->x1, area->y1, w, h);
+    tft.pushColors((uint16_t *)&color_p->full, w * h, true);
+    tft.endWrite();
+
+    lv_disp_flush_ready(disp);
+}
+
+// ================================
+// Touch read
+// ================================
+void my_touch_read(lv_indev_drv_t * indev_driver, lv_indev_data_t * data) {
+    static int16_t last_x = 0;
+    static int16_t last_y = 0;
+
+    if (touch.touched()) {
+        TS_Point p = touch.getPoint();
+        int x = map(p.x, 300, 3900, 0, SCREEN_WIDTH);
+        int y = map(p.y, 240, 3800, 0, SCREEN_HEIGHT);
+
+        last_x = x;
+        last_y = y;
+
+        data->state = LV_INDEV_STATE_PR;
+        data->point.x = x;
+        data->point.y = y;
+    } else {
+        data->state = LV_INDEV_STATE_REL;
+        data->point.x = last_x;
+        data->point.y = last_y;
+    }
+}
+
+// ================================
+// Button1: send textarea text
+// ================================
+void sendBtn_event_cb(lv_event_t * e) {
+    const char *msg = lv_textarea_get_text(ui_TextArea1);
+    if (strlen(msg) == 0) return;
+
+    Serial.printf("Sending message: %s\n", msg);
+    esp_now_send(receiverAddress, (uint8_t *)msg, strlen(msg) + 1);
+
+    lv_textarea_set_text(ui_TextArea1, "");
+    showMessageSentTick();
+}
+
+// ================================
+// Button2: send rollers combination
+// ================================
+void sendRollers_event_cb(lv_event_t * e) {
+    char r1[4], r2[4], r3[4], r4[4], r5[4], r6[4], r7[4];
+
+    lv_roller_get_selected_str(ui_Roller1, r1, sizeof(r1));
+    lv_roller_get_selected_str(ui_Roller2, r2, sizeof(r2));
+    lv_roller_get_selected_str(ui_Roller3, r3, sizeof(r3));
+    lv_roller_get_selected_str(ui_Roller4, r4, sizeof(r4));
+    lv_roller_get_selected_str(ui_Roller5, r5, sizeof(r5));
+    lv_roller_get_selected_str(ui_Roller6, r6, sizeof(r6));
+    lv_roller_get_selected_str(ui_Roller7, r7, sizeof(r7));
+
+    char msg[32];
+    snprintf(msg, sizeof(msg), "%s%s%s%s%s%s%s", r2, r1, r3, r4, r5, r6, r7);
+
+    Serial.printf("Roller message: %s\n", msg);
+    esp_now_send(receiverAddress, (uint8_t *)msg, strlen(msg) + 1);
+    showMessageSentTick();
+}
+
+// ================================
+void setup() {
+    Serial.begin(115200);
+
+    // TFT init
+    tft.begin();
+    tft.setRotation(3);
+
+    // Touch SPI init
+    touchSPI.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
+    touch.begin(touchSPI);
+    touch.setRotation(3);
+
+    // LVGL init
+    lv_init();
+    lv_disp_draw_buf_init(&draw_buf, buf, NULL, SCREEN_WIDTH * 10);
+
+    static lv_disp_drv_t disp_drv;
+    lv_disp_drv_init(&disp_drv);
+    disp_drv.hor_res = SCREEN_WIDTH;
+    disp_drv.ver_res = SCREEN_HEIGHT;
+    disp_drv.flush_cb = my_disp_flush;
+    disp_drv.draw_buf = &draw_buf;
+    lv_disp_drv_register(&disp_drv);
+
+    static lv_indev_drv_t indev_drv;
+    lv_indev_drv_init(&indev_drv);
+    indev_drv.type = LV_INDEV_TYPE_POINTER;
+    indev_drv.read_cb = my_touch_read;
+    indev_touch = lv_indev_drv_register(&indev_drv);
+
+    // Load UI
+    ui_init();
+
+    // Attach events
+    lv_obj_add_event_cb(ui_Button1, sendBtn_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ui_Button2, sendRollers_event_cb, LV_EVENT_CLICKED, NULL);
+
+    // Init ESP-NOW
+    initEspNow();
+}
+
+void loop() {
+    lv_timer_handler();
+    delay(5);
+}
