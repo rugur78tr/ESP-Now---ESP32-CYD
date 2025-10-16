@@ -1,0 +1,103 @@
+#include <lvgl.h>
+#include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
+#include "ui.h"   // your SquareLine-generated UI
+
+// --- CYD-2432S028 Pin Config ---
+#define TOUCH_CS   33
+#define TOUCH_IRQ  36
+#define TOUCH_MISO 39
+#define TOUCH_MOSI 32
+#define TOUCH_CLK  25
+
+#define SCREEN_WIDTH  320
+#define SCREEN_HEIGHT 240
+
+// --- Display & Touch ---
+TFT_eSPI tft = TFT_eSPI();
+SPIClass touchSPI(VSPI);
+XPT2046_Touchscreen touch(TOUCH_CS, TOUCH_IRQ);
+
+lv_disp_draw_buf_t draw_buf;
+lv_color_t buf[SCREEN_WIDTH * 10];
+lv_indev_t *indev_touch;
+
+// --- LVGL Display flush ---
+void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
+  uint32_t w = (area->x2 - area->x1 + 1);
+  uint32_t h = (area->y2 - area->y1 + 1);
+
+  tft.startWrite();
+  tft.setAddrWindow(area->x1, area->y1, w, h);
+  tft.pushColors((uint16_t *)&color_p->full, w * h, true);
+  tft.endWrite();
+
+  lv_disp_flush_ready(disp);
+}
+
+// --- LVGL Touch read ---
+void my_touch_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
+  static int16_t last_x = 0;
+  static int16_t last_y = 0;
+
+  if (touch.touched()) {
+    TS_Point p = touch.getPoint();
+
+    int x = map(p.x, 300, 3900, 0, SCREEN_WIDTH);
+    int y = map(p.y, 240, 3800, 0, SCREEN_HEIGHT);
+
+    last_x = x;
+    last_y = y;
+
+    data->state = LV_INDEV_STATE_PR;
+    data->point.x = x;
+    data->point.y = y;
+  } else {
+    data->state = LV_INDEV_STATE_REL;
+    data->point.x = last_x;
+    data->point.y = last_y;
+  }
+}
+
+// --- Setup ---
+void setup() {
+  Serial.begin(115200);
+
+  // TFT init
+  tft.begin();
+  tft.setRotation(3);
+
+  // Touch init
+  touchSPI.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
+  touch.begin(touchSPI);
+  touch.setRotation(3);
+
+  // LVGL init
+  lv_init();
+  lv_disp_draw_buf_init(&draw_buf, buf, NULL, SCREEN_WIDTH * 10);
+
+  static lv_disp_drv_t disp_drv;
+  lv_disp_drv_init(&disp_drv);
+  disp_drv.hor_res = SCREEN_WIDTH;
+  disp_drv.ver_res = SCREEN_HEIGHT;
+  disp_drv.flush_cb = my_disp_flush;
+  disp_drv.draw_buf = &draw_buf;
+  lv_disp_drv_register(&disp_drv);
+
+  static lv_indev_drv_t indev_drv;
+  lv_indev_drv_init(&indev_drv);
+  indev_drv.type = LV_INDEV_TYPE_POINTER;
+  indev_drv.read_cb = my_touch_read;
+  indev_touch = lv_indev_drv_register(&indev_drv);
+
+  // --- Load your SquareLine UI ---
+  ui_init();
+
+  Serial.println("LVGL UI loaded successfully!");
+}
+
+// --- Loop ---
+void loop() {
+  lv_timer_handler();
+  delay(5);
+}
